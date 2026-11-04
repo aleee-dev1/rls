@@ -16,8 +16,17 @@ const COL_SYMLINK: &str = "\x1b[36m";
 const COL_SIZE: &str = "\x1b[90m";
 const COL_RESET: &str = "\x1b[0m";
 
+// Detail column colors used with -c: -r blue, -w red, -x green, directory/link
+// marker blue, dashes grey, usage yellow, owner purple, dates grey.
+const COL_READ: &str = "\x1b[34m";
+const COL_WRITE: &str = "\x1b[31m";
+const COL_CHMOD: &str = "\x1b[32m";
+const COL_USAGE: &str = "\x1b[33m";
+const COL_OWNER: &str = "\x1b[35m";
+
 // ==================== ITEM ====================
 
+#[derive(Clone)]
 struct Item {
     name: String,
     full_path: PathBuf,
@@ -177,6 +186,34 @@ fn format_permissions(mode: u32, is_dir: bool, is_symlink: bool) -> String {
     )
 }
 
+// ==================== DETAIL COLUMN COLORS ====================
+
+/// Wraps a detail value in a single color (used with `-c` off, where all
+/// detail columns are plain grey, or simple colored columns).
+fn wrap_detail(code: &str, plain: &str) -> String {
+    format!("{}{}{}", code, plain, COL_RESET)
+}
+
+/// Colors a permission string char by char: r blue, w red, x green,
+/// d/l (type marker) blue, dashes grey.
+fn colored_permissions(mode: u32, is_dir: bool, is_symlink: bool) -> String {
+    let plain = format_permissions(mode, is_dir, is_symlink);
+    let mut out = String::new();
+    for c in plain.chars() {
+        let code = match c {
+            'r' => COL_READ,
+            'w' => COL_WRITE,
+            'x' => COL_CHMOD,
+            'd' | 'l' => COL_READ,
+            _ => COL_SIZE,
+        };
+        out.push_str(code);
+        out.push(c);
+        out.push_str(COL_RESET);
+    }
+    out
+}
+
 // ==================== OWNER ====================
 
 fn get_owner_group(uid: u32, gid: u32) -> String {
@@ -322,6 +359,8 @@ OPTIONS:\n    \
 -u, --usage           Show file/directory size\n    \
 -p, --permissions     Show permission string (e.g. -rw-r--r--)\n    \
 -o, --owner           Show owner and group (user:group)\n    \
+-c, --color           Colorize detail columns (r blue, w red, x green,\n                          usage yellow, owner purple, dates grey)\n                          Detail columns appear before names, aligned\n                          across the whole tree, in flag order; tree lines\n                          hang under the parent name's first character\
+\n    \
 -d, --details         Show directory summary at the end\n    \
 -r, --recursive       Recursively list subdirectories (tree view)\n    \
 -k <keyword>          Filter files matching keyword (case-insensitive)\n    \
@@ -332,31 +371,37 @@ OPTIONS:\n    \
 struct Args {
     target: String,
     show_hidden: bool,
-    show_usage: bool,
     show_details: bool,
-    show_permissions: bool,
-    show_owner: bool,
+    detail_order: Vec<DisplayMode>,
     sort_field: char,
     sort_dir: char,
-    sort_specified: bool,
     keyword: Option<String>,
     recursive: bool,
     max_depth: Option<i32>,
+    colored: bool,
 }
 
 fn parse_args() -> Args {
     let mut target: Option<String> = None;
     let mut show_hidden = false;
-    let mut show_usage = false;
     let mut show_details = false;
-    let mut show_permissions = false;
-    let mut show_owner = false;
     let mut sort_field = 'c';
     let mut sort_dir = 'a';
-    let mut sort_specified = false;
     let mut keyword: Option<String> = None;
     let mut recursive = false;
     let mut max_depth: Option<i32> = None;
+    let mut colored = false;
+
+    // Detail columns are recorded in the order their flags appear on the
+    // command line, so `-pou` renders permissions, owner, usage.
+    let mut detail_order: Vec<DisplayMode> = Vec::new();
+    macro_rules! push_col {
+        ($m:expr) => {
+            if !detail_order.contains(&$m) {
+                detail_order.push($m);
+            }
+        };
+    }
 
     let raw: Vec<String> = env::args().skip(1).collect();
     let mut i = 0;
@@ -370,11 +415,13 @@ fn parse_args() -> Args {
         } else if arg == "-a" || arg == "-H" || arg == "--all" || arg == "--hidden" {
             show_hidden = true;
         } else if arg == "-u" || arg == "--usage" || arg == "--size" {
-            show_usage = true;
+            push_col!(DisplayMode::Usage);
         } else if arg == "-p" || arg == "--permissions" || arg == "--perm" {
-            show_permissions = true;
+            push_col!(DisplayMode::Permissions);
         } else if arg == "-o" || arg == "--owner" {
-            show_owner = true;
+            push_col!(DisplayMode::Owner);
+        } else if arg == "-c" || arg == "--color" || arg == "--colour" {
+            colored = true;
         } else if arg == "-d" || arg == "--details" {
             show_details = true;
         } else if arg == "-r" || arg == "--recursive" {
@@ -415,7 +462,6 @@ fn parse_args() -> Args {
                 eprintln!("error: option '--sort' requires a sort specifier (e.g. --sort=n, --sort=cd)");
                 std::process::exit(1);
             }
-            sort_specified = true;
             let mut chars = spec.chars();
             let f = chars.next().unwrap();
             if !"ncmu".contains(f) {
@@ -430,8 +476,13 @@ fn parse_args() -> Args {
                 }
                 sort_dir = d;
             }
+            match sort_field {
+                'c' => push_col!(DisplayMode::Created),
+                'm' => push_col!(DisplayMode::Modified),
+                'u' => push_col!(DisplayMode::Usage),
+                _ => {}
+            }
         } else if arg.starts_with("-s") {
-            sort_specified = true;
             let rest = &arg[2..];
             let mut chars = rest.chars();
             let f = match chars.next() {
@@ -453,17 +504,24 @@ fn parse_args() -> Args {
                 }
                 sort_dir = d;
             }
+            match sort_field {
+                'c' => push_col!(DisplayMode::Created),
+                'm' => push_col!(DisplayMode::Modified),
+                'u' => push_col!(DisplayMode::Usage),
+                _ => {}
+            }
         } else if arg.starts_with('-') {
             let rest = &arg[1..];
             let mut valid = true;
             for c in rest.chars() {
                 match c {
                     'a' | 'H' => show_hidden = true,
-                    'u' => show_usage = true,
-                    'p' => show_permissions = true,
-                    'o' => show_owner = true,
+                    'u' => push_col!(DisplayMode::Usage),
+                    'p' => push_col!(DisplayMode::Permissions),
+                    'o' => push_col!(DisplayMode::Owner),
                     'd' => show_details = true,
                     'r' => recursive = true,
+                    'c' => colored = true,
                     _ => {
                         valid = false;
                         break;
@@ -488,16 +546,14 @@ fn parse_args() -> Args {
     Args {
         target: target.unwrap_or_else(|| ".".to_string()),
         show_hidden,
-        show_usage,
         show_details,
-        show_permissions,
-        show_owner,
+        detail_order,
         sort_field,
         sort_dir,
-        sort_specified,
         keyword,
         recursive,
         max_depth,
+        colored,
     }
 }
 
@@ -596,6 +652,51 @@ struct DetailsStats {
 
 // ==================== PROCESS DIRECTORY ====================
 
+/// One collected output row: the item itself, the tree prefix to draw inside
+/// the name zone, and the plain (uncolored) values of each detail column.
+struct Row {
+    item: Item,
+    tree_prefix: String,
+    plains: Vec<String>,
+}
+
+/// Plain (uncolored) text value of a detail column for an item. Widths are
+/// computed from these.
+fn detail_plain(mode: &DisplayMode, item: &Item) -> String {
+    match mode {
+        DisplayMode::Type => item.file_type.clone(),
+        DisplayMode::Usage => format_size(item.size),
+        DisplayMode::Permissions => format_permissions(item.mode, item.is_dir, item.is_symlink),
+        DisplayMode::Owner => get_owner_group(item.uid, item.gid),
+        DisplayMode::Created => format_datetime(item.created),
+        DisplayMode::Modified => format_datetime(item.modified),
+    }
+}
+
+/// Detailed display value of a detail column: grey when `-c` is off, or the
+/// per-column `-c` color (usage yellow, owner purple; permissions get their
+/// char-by-char coloring; type and dates stay grey).
+fn detail_display(mode: &DisplayMode, plain: &str, item: &Item, colored: bool) -> String {
+    match mode {
+        DisplayMode::Usage => wrap_detail(
+            if colored { COL_USAGE } else { COL_SIZE },
+            plain,
+        ),
+        DisplayMode::Permissions => {
+            if colored {
+                colored_permissions(item.mode, item.is_dir, item.is_symlink)
+            } else {
+                wrap_detail(COL_SIZE, plain)
+            }
+        }
+        DisplayMode::Owner => wrap_detail(
+            if colored { COL_OWNER } else { COL_SIZE },
+            plain,
+        ),
+        _ => wrap_detail(COL_SIZE, plain),
+    }
+}
+
 fn process_directory(
     path: &Path,
     depth: usize,
@@ -604,13 +705,14 @@ fn process_directory(
     detail_modes: &[DisplayMode],
     stats: &mut DetailsStats,
     prefix: &str,
+    rows: &mut Vec<Row>,
 ) {
     let entries = match fs::read_dir(path) {
         Ok(e) => e,
         Err(_) => return,
     };
 
-    let need_size = args.show_usage || (args.sort_specified && args.sort_field == 'u');
+    let need_size = args.detail_order.iter().any(|m| matches!(m, DisplayMode::Usage));
     let mut items: Vec<Item> = Vec::new();
 
     for entry in entries.flatten() {
@@ -637,14 +739,12 @@ fn process_directory(
         let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
         let direct_size = metadata.len();
 
-        let size = if need_size {
-            if is_dir {
-                directory_usage(&full_path, args)
-            } else {
-                direct_size
-            }
-        } else {
+        let size = if is_dir && need_size {
+            directory_usage(&full_path, args)
+        } else if is_dir {
             0
+        } else {
+            direct_size
         };
 
         items.push(Item {
@@ -721,53 +821,6 @@ fn process_directory(
         }
     }
 
-    let max_name_width = matching_indices
-        .iter()
-        .map(|&i| items[i].name.chars().count())
-        .max()
-        .unwrap_or(0);
-
-    let detail_cols: Vec<(Vec<String>, usize, bool)> = detail_modes
-        .iter()
-        .map(|mode| {
-            let (vals, is_right_aligned): (Vec<String>, bool) = match mode {
-                DisplayMode::Usage => (
-                    items.iter().map(|i| format_size(i.size)).collect(),
-                    true,
-                ),
-                DisplayMode::Permissions => (
-                    items
-                        .iter()
-                        .map(|i| format_permissions(i.mode, i.is_dir, i.is_symlink))
-                        .collect(),
-                    false,
-                ),
-                DisplayMode::Type => (
-                    items.iter().map(|i| i.file_type.clone()).collect(),
-                    false,
-                ),
-                DisplayMode::Owner => (
-                    items.iter().map(|i| get_owner_group(i.uid, i.gid)).collect(),
-                    false,
-                ),
-                DisplayMode::Created => (
-                    items.iter().map(|i| format_datetime(i.created)).collect(),
-                    false,
-                ),
-                DisplayMode::Modified => (
-                    items.iter().map(|i| format_datetime(i.modified)).collect(),
-                    false,
-                ),
-            };
-            let max_w = matching_indices
-                .iter()
-                .map(|&i| vals[i].chars().count())
-                .max()
-                .unwrap_or(0);
-            (vals, max_w, is_right_aligned)
-        })
-        .collect();
-
     let last_printed_idx = matching_indices.last().copied();
 
     for (row_idx, item) in items.iter().enumerate() {
@@ -784,52 +837,26 @@ fn process_directory(
         };
 
         if matches_keyword {
-            let color = get_color(item.is_dir, item.is_symlink, item.mode);
-            let name_len = item.name.chars().count();
-
-            let col1_pad = if detail_cols.is_empty() {
-                0
-            } else {
-                max_name_width - name_len
-            };
-
-            let mut line = format!("{}{}{}{}{}{}", prefix, connector, color, item.name, COL_RESET, " ".repeat(col1_pad));
-
-            for (col_idx, (vals, max_w, is_right_aligned)) in detail_cols.iter().enumerate() {
-                let val = &vals[row_idx];
-                let val_len = val.chars().count();
-                let pad = max_w - val_len;
-                let is_last_col = col_idx == detail_cols.len() - 1;
-
-                line.push_str("  ");
-
-                if *is_right_aligned {
-                    line.push_str(&format!("{}{}{}{}", COL_SIZE, " ".repeat(pad), val, COL_RESET));
-                } else {
-                    let col_pad = if is_last_col { 0 } else { pad };
-                    line.push_str(&format!("{}{}{}{}", COL_SIZE, val, COL_RESET, " ".repeat(col_pad)));
-                }
-            }
-
-            println!("{}", line);
+            // Collect the row; columns and tree lines are rendered once all
+            // rows are known, with widths shared across the whole tree.
+            rows.push(Row {
+                item: item.clone(),
+                tree_prefix: format!("{}{}", prefix, connector),
+                plains: detail_modes.iter().map(|m| detail_plain(m, item)).collect(),
+            });
         }
 
         if args.recursive && matches_keyword && item.is_dir && !item.is_symlink && depth < allowed_depth {
-            // Children of top-level entries start under the first character
-            // of the parent's name (empty prefix), and no vertical line is
-            // drawn leading back to them. Deeper levels use `│   ` for
-            // ancestors that still have siblings.
-            let child_prefix = format!(
-                "{}{}",
-                prefix,
-                if depth == 0 {
-                    ""
-                } else if is_last_slot {
-                    "    "
-                } else {
-                    "│   "
-                }
-            );
+            // The tree lives inside the name zone: a child's connector must
+            // land exactly where this item's name begins, so the classic
+            // 4-column slot logic applies; no column widths are involved.
+            let child_prefix = if depth == 0 {
+                prefix.to_string()
+            } else if is_last_slot {
+                format!("{}    ", prefix)
+            } else {
+                format!("{}│   ", prefix)
+            };
             process_directory(
                 &item.full_path,
                 depth + 1,
@@ -838,6 +865,7 @@ fn process_directory(
                 detail_modes,
                 stats,
                 &child_prefix,
+                rows,
             );
         }
     }
@@ -848,31 +876,16 @@ fn process_directory(
 fn main() {
     let args = parse_args();
 
-    let sort_detail = if args.sort_specified {
-        match args.sort_field {
-            'c' => Some(DisplayMode::Created),
-            'm' => Some(DisplayMode::Modified),
-            _ => None,
-        }
-    } else {
-        None
-    };
+    let show_size = args.detail_order.contains(&DisplayMode::Usage);
 
-    let show_size = args.show_usage || (args.sort_specified && args.sort_field == 'u');
-
+    // The file type column stays first by default; the remaining columns
+    // follow the order in which their flags were given.
     let mut detail_modes: Vec<DisplayMode> = Vec::new();
     detail_modes.push(DisplayMode::Type);
-    if show_size {
-        detail_modes.push(DisplayMode::Usage);
-    }
-    if args.show_permissions {
-        detail_modes.push(DisplayMode::Permissions);
-    }
-    if args.show_owner {
-        detail_modes.push(DisplayMode::Owner);
-    }
-    if let Some(d) = sort_detail {
-        detail_modes.push(d);
+    for mode in &args.detail_order {
+        if !detail_modes.contains(mode) {
+            detail_modes.push(*mode);
+        }
     }
 
     let target_path = Path::new(&args.target);
@@ -905,7 +918,50 @@ fn main() {
         total_size: 0,
     };
 
-    process_directory(target_path, 0, allowed_depth, &args, &detail_modes, &mut stats, "");
+    // Collect every visible row first so detail column widths can be shared
+    // across the whole tree, then render.
+    let mut rows: Vec<Row> = Vec::new();
+    process_directory(target_path, 0, allowed_depth, &args, &detail_modes, &mut stats, "", &mut rows);
+
+    let mut widths: Vec<usize> = vec![0; detail_modes.len()];
+    for row in &rows {
+        for (ci, plain) in row.plains.iter().enumerate() {
+            widths[ci] = widths[ci].max(plain.chars().count());
+        }
+    }
+
+    for row in &rows {
+        let mut line = String::new();
+        // Detail columns at line start, in flag order, space separated and
+        // padded so they align across the entire listing.
+        for (ci, mode) in detail_modes.iter().enumerate() {
+            let plain = &row.plains[ci];
+            let disp = detail_display(mode, plain, &row.item, args.colored);
+            let pad = widths[ci].saturating_sub(plain.chars().count());
+
+            if matches!(mode, DisplayMode::Usage) {
+                line.push_str(&" ".repeat(pad));
+                line.push_str(&disp);
+            } else {
+                line.push_str(&disp);
+                line.push_str(&" ".repeat(pad));
+            }
+
+            if ci != detail_modes.len() - 1 {
+                line.push(' ');
+            }
+        }
+        line.push_str("  ");
+        // Tree lines live inside the name zone: first-level items start
+        // bare, nested ones hang under their parent's name character.
+        line.push_str(&row.tree_prefix);
+        let color = get_color(row.item.is_dir, row.item.is_symlink, row.item.mode);
+        line.push_str(color);
+        line.push_str(&row.item.name);
+        line.push_str(COL_RESET);
+
+        println!("{}", line);
+    }
 
     if args.show_details {
         let mut details = format!(

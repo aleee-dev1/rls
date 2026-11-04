@@ -177,24 +177,6 @@ fn format_permissions(mode: u32, is_dir: bool, is_symlink: bool) -> String {
     )
 }
 
-fn format_rwx(r: bool, w: bool, x: bool) -> String {
-    let mut s = String::new();
-    if r {
-        s.push('r');
-    }
-    if w {
-        s.push('w');
-    }
-    if x {
-        s.push('x');
-    }
-    if s.is_empty() {
-        "-".to_string()
-    } else {
-        s
-    }
-}
-
 // ==================== OWNER ====================
 
 fn get_owner_group(uid: u32, gid: u32) -> String {
@@ -257,13 +239,14 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
-// ==================== APPARENT SIZE ====================
+// ==================== DIRECTORY USAGE ====================
 
-fn apparent_size(path: &Path, is_dir: bool, direct_size: u64) -> u64 {
-    if !is_dir {
-        return direct_size;
-    }
-
+/// Total usage of a directory subtree under the current filters:
+/// - hidden files/dirs (`-a`/`-H`) are included only when they are shown;
+/// - with `-k`, only files matching the keyword are counted;
+/// - symlinks count as their own size.
+/// Plain files simply report their own size.
+fn directory_usage(path: &Path, args: &Args) -> u64 {
     let mut total = 0u64;
 
     let entries = match fs::read_dir(path) {
@@ -272,16 +255,28 @@ fn apparent_size(path: &Path, is_dir: bool, direct_size: u64) -> u64 {
     };
 
     for entry in entries.flatten() {
-        let child_path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !args.show_hidden && name.starts_with('.') {
+            continue;
+        }
 
-        let metadata = match fs::symlink_metadata(&child_path) {
+        let full_path = entry.path();
+        let metadata = match fs::symlink_metadata(&full_path) {
             Ok(m) => m,
             Err(_) => continue,
         };
 
-        if metadata.is_dir() {
-            total += apparent_size(&child_path, true, 0);
-        } else {
+        let matches_keyword = match &args.keyword {
+            Some(k) => name.to_lowercase().contains(k.as_str()),
+            None => true,
+        };
+
+        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            // Descend only when the subtree can contribute something.
+            if matches_keyword || subtree_contains_match(&full_path, 0, usize::MAX, args) {
+                total += directory_usage(&full_path, args);
+            }
+        } else if matches_keyword {
             total += metadata.len();
         }
     }
@@ -326,10 +321,9 @@ OPTIONS:\n    \
 -a, -H, --all         Show hidden files (starting with .)\n    \
 -u, --usage           Show file/directory size\n    \
 -p, --permissions     Show permission string (e.g. -rw-r--r--)\n    \
--pd, --perm-detail    Show detailed permissions (ow:rwx g:rx ot:rx)\n    \
 -o, --owner           Show owner and group (user:group)\n    \
--d, --summary         Show directory summary at the end\n    \
--r, --recursive       Recursively list subdirectories\n    \
+-d, --details         Show directory summary at the end\n    \
+-r, --recursive       Recursively list subdirectories (tree view)\n    \
 -k <keyword>          Filter files matching keyword (case-insensitive)\n    \
 -s<field>[a|d]        Sort by field (n: name, c: created, m: modified, u: size)\n                          Direction: a (ascending, default), d (descending)\n                          Example: -sn, -scd, -su"
     );
@@ -339,9 +333,8 @@ struct Args {
     target: String,
     show_hidden: bool,
     show_usage: bool,
-    show_summary: bool,
+    show_details: bool,
     show_permissions: bool,
-    show_perm_detail: bool,
     show_owner: bool,
     sort_field: char,
     sort_dir: char,
@@ -355,9 +348,8 @@ fn parse_args() -> Args {
     let mut target: Option<String> = None;
     let mut show_hidden = false;
     let mut show_usage = false;
-    let mut show_summary = false;
+    let mut show_details = false;
     let mut show_permissions = false;
-    let mut show_perm_detail = false;
     let mut show_owner = false;
     let mut sort_field = 'c';
     let mut sort_dir = 'a';
@@ -381,12 +373,10 @@ fn parse_args() -> Args {
             show_usage = true;
         } else if arg == "-p" || arg == "--permissions" || arg == "--perm" {
             show_permissions = true;
-        } else if arg == "-pd" || arg == "--perm-detail" {
-            show_perm_detail = true;
         } else if arg == "-o" || arg == "--owner" {
             show_owner = true;
-        } else if arg == "-d" || arg == "--summary" {
-            show_summary = true;
+        } else if arg == "-d" || arg == "--details" {
+            show_details = true;
         } else if arg == "-r" || arg == "--recursive" {
             recursive = true;
             if i + 1 < raw.len() {
@@ -465,28 +455,24 @@ fn parse_args() -> Args {
             }
         } else if arg.starts_with('-') {
             let rest = &arg[1..];
-            if rest == "pd" {
-                show_perm_detail = true;
-            } else {
-                let mut valid = true;
-                for c in rest.chars() {
-                    match c {
-                        'a' | 'H' => show_hidden = true,
-                        'u' => show_usage = true,
-                        'p' => show_permissions = true,
-                        'o' => show_owner = true,
-                        'd' => show_summary = true,
-                        'r' => recursive = true,
-                        _ => {
-                            valid = false;
-                            break;
-                        }
+            let mut valid = true;
+            for c in rest.chars() {
+                match c {
+                    'a' | 'H' => show_hidden = true,
+                    'u' => show_usage = true,
+                    'p' => show_permissions = true,
+                    'o' => show_owner = true,
+                    'd' => show_details = true,
+                    'r' => recursive = true,
+                    _ => {
+                        valid = false;
+                        break;
                     }
                 }
-                if !valid {
-                    eprintln!("error: unrecognized flag '{}'\nTry 'rls --help' for more information.", arg);
-                    std::process::exit(1);
-                }
+            }
+            if !valid {
+                eprintln!("error: unrecognized flag '{}'\nTry 'rls --help' for more information.", arg);
+                std::process::exit(1);
             }
         } else {
             if target.is_some() {
@@ -503,9 +489,8 @@ fn parse_args() -> Args {
         target: target.unwrap_or_else(|| ".".to_string()),
         show_hidden,
         show_usage,
-        show_summary,
+        show_details,
         show_permissions,
-        show_perm_detail,
         show_owner,
         sort_field,
         sort_dir,
@@ -514,6 +499,46 @@ fn parse_args() -> Args {
         recursive,
         max_depth,
     }
+}
+
+// ==================== KEYWORD MATCH ====================
+
+/// Returns true if the subtree at `path` (a directory at `dir_depth`) contains
+/// any file whose name matches the keyword. Used to show ancestor directories
+/// of matching files so the tree under `-r -k` stays connected.
+fn subtree_contains_match(path: &Path, dir_depth: usize, allowed_depth: usize, args: &Args) -> bool {
+    let keyword = match &args.keyword {
+        Some(k) => k,
+        None => return true,
+    };
+
+    let entries = match fs::read_dir(path) {
+        Ok(e) => e,
+        Err(_) => return false,
+    };
+
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !args.show_hidden && name.starts_with('.') {
+            continue;
+        }
+
+        let full_path = entry.path();
+        let metadata = match fs::symlink_metadata(&full_path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+
+        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            if dir_depth < allowed_depth && subtree_contains_match(&full_path, dir_depth + 1, allowed_depth, args) {
+                return true;
+            }
+        } else if name.to_lowercase().contains(keyword) {
+            return true;
+        }
+    }
+
+    false
 }
 
 // ==================== COMPUTE MAX DEPTH ====================
@@ -556,17 +581,14 @@ enum DisplayMode {
     Usage,
     Permissions,
     Type,
-    PermOwner,
-    PermGroup,
-    PermOthers,
     Owner,
     Created,
     Modified,
 }
 
-// ==================== SUMMARY STATS ====================
+// ==================== DETAILS STATS ====================
 
-struct SummaryStats {
+struct DetailsStats {
     dir_count: usize,
     file_count: usize,
     total_size: u64,
@@ -580,7 +602,8 @@ fn process_directory(
     allowed_depth: usize,
     args: &Args,
     detail_modes: &[DisplayMode],
-    stats: &mut SummaryStats,
+    stats: &mut DetailsStats,
+    prefix: &str,
 ) {
     let entries = match fs::read_dir(path) {
         Ok(e) => e,
@@ -615,7 +638,11 @@ fn process_directory(
         let direct_size = metadata.len();
 
         let size = if need_size {
-            apparent_size(&full_path, is_dir, direct_size)
+            if is_dir {
+                directory_usage(&full_path, args)
+            } else {
+                direct_size
+            }
         } else {
             0
         };
@@ -654,11 +681,21 @@ fn process_directory(
         .iter()
         .enumerate()
         .filter_map(|(idx, item)| {
-            let matches_keyword = match &args.keyword {
-                Some(k) => item.name.to_lowercase().contains(k.as_str()),
+            let show = match &args.keyword {
+                Some(k) => {
+                    if item.name.to_lowercase().contains(k) {
+                        true
+                    } else if args.recursive && item.is_dir && !item.is_symlink {
+                        // Keep ancestor directories of matching files so the
+                        // tree under `-r -k` stays connected (like `tree -P`).
+                        subtree_contains_match(&item.full_path, depth, allowed_depth, args)
+                    } else {
+                        false
+                    }
+                }
                 None => true,
             };
-            if matches_keyword {
+            if show {
                 Some(idx)
             } else {
                 None
@@ -670,6 +707,14 @@ fn process_directory(
         let item = &items[idx];
         if item.is_dir {
             stats.dir_count += 1;
+            // A directory whose subtree will be listed already contributes its
+            // files at deeper levels; adding its own apparent size here would
+            // double count. Only unexpanded (or depth-capped) directories
+            // contribute their contents to the total.
+            let will_recurse = args.recursive && !item.is_symlink && depth < allowed_depth;
+            if !will_recurse {
+                stats.total_size += directory_usage(&item.full_path, args);
+            }
         } else {
             stats.file_count += 1;
             stats.total_size += item.size;
@@ -701,54 +746,6 @@ fn process_directory(
                     items.iter().map(|i| i.file_type.clone()).collect(),
                     false,
                 ),
-                DisplayMode::PermOwner => (
-                    items
-                        .iter()
-                        .map(|i| {
-                            format!(
-                                "ow:{}",
-                                format_rwx(
-                                    i.mode & 0o400 != 0,
-                                    i.mode & 0o200 != 0,
-                                    i.mode & 0o100 != 0
-                                )
-                            )
-                        })
-                        .collect(),
-                    false,
-                ),
-                DisplayMode::PermGroup => (
-                    items
-                        .iter()
-                        .map(|i| {
-                            format!(
-                                "g:{}",
-                                format_rwx(
-                                    i.mode & 0o040 != 0,
-                                    i.mode & 0o020 != 0,
-                                    i.mode & 0o010 != 0
-                                )
-                            )
-                        })
-                        .collect(),
-                    false,
-                ),
-                DisplayMode::PermOthers => (
-                    items
-                        .iter()
-                        .map(|i| {
-                            format!(
-                                "ot:{}",
-                                format_rwx(
-                                    i.mode & 0o004 != 0,
-                                    i.mode & 0o002 != 0,
-                                    i.mode & 0o001 != 0
-                                )
-                            )
-                        })
-                        .collect(),
-                    false,
-                ),
                 DisplayMode::Owner => (
                     items.iter().map(|i| get_owner_group(i.uid, i.gid)).collect(),
                     false,
@@ -771,10 +768,20 @@ fn process_directory(
         })
         .collect();
 
-    let indent = " ".repeat(depth * 2);
+    let last_printed_idx = matching_indices.last().copied();
 
     for (row_idx, item) in items.iter().enumerate() {
         let matches_keyword = matching_indices.contains(&row_idx);
+        let is_last_slot = last_printed_idx == Some(row_idx);
+        // Top-level entries hang directly from the target directory, so no
+        // connector is drawn for them; only their children get tree lines.
+        let connector: &str = if depth == 0 {
+            ""
+        } else if is_last_slot {
+            "└── "
+        } else {
+            "├── "
+        };
 
         if matches_keyword {
             let color = get_color(item.is_dir, item.is_symlink, item.mode);
@@ -786,7 +793,7 @@ fn process_directory(
                 max_name_width - name_len
             };
 
-            let mut line = format!("{}{}{}{}{}", indent, color, item.name, COL_RESET, " ".repeat(col1_pad));
+            let mut line = format!("{}{}{}{}{}{}", prefix, connector, color, item.name, COL_RESET, " ".repeat(col1_pad));
 
             for (col_idx, (vals, max_w, is_right_aligned)) in detail_cols.iter().enumerate() {
                 let val = &vals[row_idx];
@@ -807,8 +814,31 @@ fn process_directory(
             println!("{}", line);
         }
 
-        if args.recursive && item.is_dir && !item.is_symlink && depth < allowed_depth {
-            process_directory(&item.full_path, depth + 1, allowed_depth, args, detail_modes, stats);
+        if args.recursive && matches_keyword && item.is_dir && !item.is_symlink && depth < allowed_depth {
+            // Children of top-level entries start under the first character
+            // of the parent's name (empty prefix), and no vertical line is
+            // drawn leading back to them. Deeper levels use `│   ` for
+            // ancestors that still have siblings.
+            let child_prefix = format!(
+                "{}{}",
+                prefix,
+                if depth == 0 {
+                    ""
+                } else if is_last_slot {
+                    "    "
+                } else {
+                    "│   "
+                }
+            );
+            process_directory(
+                &item.full_path,
+                depth + 1,
+                allowed_depth,
+                args,
+                detail_modes,
+                stats,
+                &child_prefix,
+            );
         }
     }
 }
@@ -835,11 +865,7 @@ fn main() {
     if show_size {
         detail_modes.push(DisplayMode::Usage);
     }
-    if args.show_perm_detail {
-        detail_modes.push(DisplayMode::PermOwner);
-        detail_modes.push(DisplayMode::PermGroup);
-        detail_modes.push(DisplayMode::PermOthers);
-    } else if args.show_permissions {
+    if args.show_permissions {
         detail_modes.push(DisplayMode::Permissions);
     }
     if args.show_owner {
@@ -873,16 +899,16 @@ fn main() {
         }
     };
 
-    let mut stats = SummaryStats {
+    let mut stats = DetailsStats {
         dir_count: 0,
         file_count: 0,
         total_size: 0,
     };
 
-    process_directory(target_path, 0, allowed_depth, &args, &detail_modes, &mut stats);
+    process_directory(target_path, 0, allowed_depth, &args, &detail_modes, &mut stats, "");
 
-    if args.show_summary {
-        let mut summary = format!(
+    if args.show_details {
+        let mut details = format!(
             "{} director{}, {} file{}",
             stats.dir_count,
             if stats.dir_count == 1 { "y" } else { "s" },
@@ -891,9 +917,11 @@ fn main() {
         );
 
         if show_size {
-            summary.push_str(&format!(", total {} used", format_size(stats.total_size)));
+            details.push_str(&format!(", total {} used", format_size(stats.total_size)));
         }
 
-        println!("{}", summary);
+        // Draw a separator above the details line, exactly as wide as it is.
+        println!("{}", "─".repeat(details.chars().count()));
+        println!("{}", details);
     }
 }

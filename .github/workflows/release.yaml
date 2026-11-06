@@ -52,11 +52,19 @@ jobs:
           mkdir -p release
           cp target/${{ matrix.target }}/release/rls release/${{ matrix.binary }}
 
+      - name: Checksum binary
+        run: |
+          mkdir -p release
+          cd release
+          sha256sum ${{ matrix.binary }} | tee ${{ matrix.binary }}.sha256
+
       - name: Upload release artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.binary }}
-          path: release/${{ matrix.binary }}
+          path: |
+            release/${{ matrix.binary }}
+            release/${{ matrix.binary }}.sha256
 
   release:
     name: Create GitHub Release
@@ -70,14 +78,29 @@ jobs:
       - name: Download release artifacts
         uses: actions/download-artifact@v5
         with:
-          path: release
+          path: dist
+
+      - name: Prepare release files and SHA256SUMS
+        run: |
+          # download-artifact nests files under per-artifact directories;
+          # flatten so release/ holds binaries + their .sha256 files.
+          mkdir -p release
+          find dist -type f -exec mv {} release/ \;
+          cd release
+          {
+            for f in rls-linux-x86_64 rls-linux-aarch64 rls-macos-x86_64 rls-macos-aarch64; do
+              test -f "$f" || { echo "missing artifact: $f" >&2; exit 1; }
+              sha256sum "$f"
+            done
+          } > SHA256SUMS
+          cat SHA256SUMS
 
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "${GITHUB_REF_NAME}" \
-            release/*/* \
+            release/* \
             --repo "${GITHUB_REPOSITORY}" \
             --title "${GITHUB_REF_NAME}" \
             --generate-notes

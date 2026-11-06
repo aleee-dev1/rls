@@ -8,27 +8,11 @@ mod usage;
 use std::io::IsTerminal;
 use std::path::Path;
 
-use args::{parse_args, Args, DisplayMode};
+use args::{parse_args, DisplayMode};
 use colors::{get_color, COL_DIR, COL_RESET};
 use format::format_size;
 use list::{detail_display, process_directory, DetailsStats};
 use usage::compute_max_depth;
-
-// ==================== PLATFORM ====================
-
-// rls builds in full on Unix targets, and in a reduced form for WASI
-// (wasm32-*) where listing, search, sorting and summaries work but the
-// columns that need Unix metadata (-u, -p, -o) are refused at runtime (see
-// `refuse_unavailable_columns` below). Any other target family has neither
-// the Unix metadata nor a libc to link its OS calls against, so those
-// builds are refused here with one legible error instead of far less clear
-// undefined-symbol diagnostics from the linker.
-#[cfg(all(not(unix), not(target_family = "wasm")))]
-compile_error!(
-    "rls supports Unix targets in full (Linux, macOS, *BSD) and wasm32-WASI \
-     targets in a reduced form (-u, -p and -o error out when used); any \
-     other platform is not supported."
-);
 
 // ==================== MAIN ====================
 
@@ -36,22 +20,14 @@ fn main() {
     // Pipe consumers (e.g. `rls -r huge | head`) close stdin early; the
     // default SIGPIPE disposition must be restored so the write to stdout
     // kills the process instead of panicking with "Broken pipe".
-    // WASI defines no signals at all; there is nothing to restore there.
-    #[cfg(unix)]
-    {
-        extern "C" {
-            fn signal(signum: i32, handler: usize) -> usize;
-        }
-        const SIGPIPE: i32 = 13;
-        const SIG_DFL: usize = 0;
-        unsafe { signal(SIGPIPE, SIG_DFL) };
+    extern "C" {
+        fn signal(signum: i32, handler: usize) -> usize;
     }
+    const SIGPIPE: i32 = 13;
+    const SIG_DFL: usize = 0;
+    unsafe { signal(SIGPIPE, SIG_DFL) };
 
     let args = parse_args();
-
-    // Columns whose data the current platform cannot provide must not print
-    // values that look real but are not.
-    refuse_unavailable_columns(&args);
 
     // A single gate decides whether ANY escape code reaches stdout: plain
     // `rls` is clean even mid-pipe unless the user opts in with --color=always.
@@ -192,51 +168,3 @@ fn main() {
         println!("{}", details);
     }
 }
-
-// ==================== PLATFORM FEATURE GATE ====================
-
-/// Refuse the detail columns whose data the current platform cannot provide,
-/// before any listing happens. These would otherwise print values that look
-/// real but are not. Listing, search (`-k`/`-f`), sorting (by the platform's
-/// available size) and summaries still work; name the fully supported
-/// platforms so the limit is discoverable.
-#[cfg(target_family = "wasm")]
-fn refuse_unavailable_columns(args: &Args) {
-    // (column, flag spellings, why the value cannot be real here)
-    let unavailable: [(DisplayMode, &str, &str); 3] = [
-        (
-            DisplayMode::Usage,
-            "-u/--usage",
-            "no allocated-block (st_blocks) disk sizes exist",
-        ),
-        (
-            DisplayMode::Permissions,
-            "-p/--permissions",
-            "no permission mode bits exist",
-        ),
-        (DisplayMode::Owner, "-o/--owner", "no uid/gid ownership exists"),
-    ];
-
-    let mut refused = false;
-    for (column, flag, why) in unavailable {
-        if args.detail_order.contains(&column) {
-            eprintln!(
-                "error: rls does not support {} on this platform: {}",
-                flag, why
-            );
-            refused = true;
-        }
-    }
-
-    if refused {
-        eprintln!(
-            "note: rls is fully supported on Linux, macOS and *BSD; this \
-             platform build lists names, types, timestamps, recursion \
-             (-r), search (-k, -f) and sorting"
-        );
-        std::process::exit(1);
-    }
-}
-
-#[cfg(not(target_family = "wasm"))]
-fn refuse_unavailable_columns(_args: &Args) {}

@@ -1,6 +1,4 @@
-#[cfg(unix)]
 use std::cell::RefCell;
-#[cfg(unix)]
 use std::collections::HashMap;
 
 use crate::colors::{COL_CHMOD, COL_READ, COL_RESET, COL_SIZE, COL_WRITE};
@@ -61,17 +59,11 @@ pub fn colored_permissions(mode: u32, is_dir: bool, is_symlink: bool) -> String 
 
 // ==================== OWNER ====================
 
-// Owner lookup goes through libc/NSS, which only exists on Unix targets; the
-// `-o` column is refused at startup on others, so the numeric fallbacks below
-// are never reached there — they keep the compile clean and the behavior
-// defined should the column ever be permitted.
 thread_local! {
     /// Memoized name lookups. `getpwuid`/`getgrgid` go through NSS, which on
     /// network backends (SSSD/LDAP) can cost a round-trip per file; each
     /// uid/gid is resolved at most once per run.
-    #[cfg(unix)]
     static USER_CACHE: RefCell<HashMap<u32, String>> = RefCell::new(HashMap::new());
-    #[cfg(unix)]
     static GROUP_CACHE: RefCell<HashMap<u32, String>> = RefCell::new(HashMap::new());
 }
 
@@ -80,76 +72,59 @@ pub fn get_owner_group(uid: u32, gid: u32) -> String {
 }
 
 fn lookup_user_name(uid: u32) -> String {
-    #[cfg(unix)]
-    {
-        USER_CACHE.with(|cache| {
-            if let Some(name) = cache.borrow().get(&uid) {
-                return name.clone();
+    USER_CACHE.with(|cache| {
+        if let Some(name) = cache.borrow().get(&uid) {
+            return name.clone();
+        }
+
+        let name = unsafe {
+            let pwd = getpwuid(uid);
+            if !pwd.is_null() && !(*pwd).pw_name.is_null() {
+                std::ffi::CStr::from_ptr((*pwd).pw_name)
+                    .to_string_lossy()
+                    .into_owned()
+            } else {
+                uid.to_string()
             }
+        };
 
-            let name = unsafe {
-                let pwd = getpwuid(uid);
-                if !pwd.is_null() && !(*pwd).pw_name.is_null() {
-                    std::ffi::CStr::from_ptr((*pwd).pw_name)
-                        .to_string_lossy()
-                        .into_owned()
-                } else {
-                    uid.to_string()
-                }
-            };
-
-            cache.borrow_mut().insert(uid, name.clone());
-            name
-        })
-    }
-    #[cfg(not(unix))]
-    {
-        uid.to_string()
-    }
+        cache.borrow_mut().insert(uid, name.clone());
+        name
+    })
 }
 
 fn lookup_group_name(gid: u32) -> String {
-    #[cfg(unix)]
-    {
-        GROUP_CACHE.with(|cache| {
-            if let Some(name) = cache.borrow().get(&gid) {
-                return name.clone();
+    GROUP_CACHE.with(|cache| {
+        if let Some(name) = cache.borrow().get(&gid) {
+            return name.clone();
+        }
+
+        let name = unsafe {
+            let grp = getgrgid(gid);
+            if !grp.is_null() && !(*grp).gr_name.is_null() {
+                std::ffi::CStr::from_ptr((*grp).gr_name)
+                    .to_string_lossy()
+                    .into_owned()
+            } else {
+                gid.to_string()
             }
+        };
 
-            let name = unsafe {
-                let grp = getgrgid(gid);
-                if !grp.is_null() && !(*grp).gr_name.is_null() {
-                    std::ffi::CStr::from_ptr((*grp).gr_name)
-                        .to_string_lossy()
-                        .into_owned()
-                } else {
-                    gid.to_string()
-                }
-            };
-
-            cache.borrow_mut().insert(gid, name.clone());
-            name
-        })
-    }
-    #[cfg(not(unix))]
-    {
-        gid.to_string()
-    }
+        cache.borrow_mut().insert(gid, name.clone());
+        name
+    })
 }
 
-#[cfg(unix)]
 extern "C" {
     fn getpwuid(uid: u32) -> *const Passwd;
     fn getgrgid(gid: u32) -> *const Group;
 }
 
-#[cfg(unix)]
 #[repr(C)]
 struct Passwd {
     pw_name: *const std::os::raw::c_char,
 }
 
-#[cfg(unix)]
 #[repr(C)]
 struct Group {
     gr_name: *const std::os::raw::c_char,

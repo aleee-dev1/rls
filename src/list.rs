@@ -1,5 +1,4 @@
 use std::fs;
-#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -11,51 +10,8 @@ use crate::format::{
 };
 use crate::item::{determine_file_type, Item};
 use crate::usage::{
-    directory_usage, disk_size, scan_keyword_hits, subtree_contains_match, WalkCache,
+    blocks_bytes, directory_usage, scan_keyword_hits, subtree_contains_match, WalkCache,
 };
-
-// ==================== PLATFORM SHIMS ====================
-
-// Unix exposes ownership/mode introspection; WASI does not, and the (-u, -p,
-// -o) columns that would show such data are refused at startup (see
-// `refuse_unavailable_columns` in main.rs). The shims below return neutral
-// values that never reach output on other targets; every platform-specific
-// decision is funneled through these so the walk itself stays shared.
-
-/// Full mode bits (`st_mode`) of a file.
-#[cfg(unix)]
-fn file_mode(metadata: &fs::Metadata) -> u32 {
-    metadata.permissions().mode()
-}
-
-// Neutral value: still feeds the executable-coloring heuristic and probe
-// gating, both of which are no-ops without real mode bits.
-#[cfg(not(unix))]
-fn file_mode(_metadata: &fs::Metadata) -> u32 {
-    0
-}
-
-/// File owner uid.
-#[cfg(unix)]
-fn file_uid(metadata: &fs::Metadata) -> u32 {
-    metadata.uid()
-}
-
-#[cfg(not(unix))]
-fn file_uid(_metadata: &fs::Metadata) -> u32 {
-    0
-}
-
-/// File owner gid.
-#[cfg(unix)]
-fn file_gid(metadata: &fs::Metadata) -> u32 {
-    metadata.gid()
-}
-
-#[cfg(not(unix))]
-fn file_gid(_metadata: &fs::Metadata) -> u32 {
-    0
-}
 
 // ==================== DETAILS STATS ====================
 
@@ -235,22 +191,16 @@ pub fn process_directory(
 
         let is_symlink = metadata.file_type().is_symlink();
         let is_dir = metadata.is_dir();
-        let mode_pre = file_mode(&metadata);
         // Opening a probe file must be reserved to plain regular files
         // (FIFOs etc. can hang `open`/`read` forever), and shebang scanning
         // is about *runnable* scripts, so only executable files are opened.
-        // Everything else is typed by extension below. WASI has no mode bits
-        // and no FIFOs/devices at all, so every regular file there is safe
-        // to probe and remains script-detectable.
-        #[cfg(unix)]
-        let probe_shebang =
-            !is_symlink && !is_dir && metadata.is_file() && mode_pre & 0o111 != 0;
-        #[cfg(not(unix))]
-        let probe_shebang = !is_symlink && !is_dir && metadata.is_file();
+        // Everything else is typed by extension below.
+        let mode_pre = metadata.permissions().mode();
+        let probe_shebang = !is_symlink && !is_dir && metadata.is_file() && mode_pre & 0o111 != 0;
         let file_type = determine_file_type(&name, is_dir, is_symlink, probe_shebang, &full_path);
         let mode = mode_pre;
-        let uid = file_uid(&metadata);
-        let gid = file_gid(&metadata);
+        let uid = metadata.uid();
+        let gid = metadata.gid();
         // Content keyword (`-k`) scans are deferred to match evaluation: only
         // entries that reach the output (or stop the budget) get read.
         let keyword_hits = None;
@@ -264,7 +214,7 @@ pub fn process_directory(
         // one exception — their inode size is the target path length, which
         // is what ls-style listings traditionally show and what st_blocks
         // reports as zero anyway.
-        let direct_size = if is_symlink { metadata.len() } else { disk_size(&metadata) };
+        let direct_size = if is_symlink { metadata.len() } else { blocks_bytes(metadata.blocks()) };
 
         let size = if is_dir && need_size {
             directory_usage(&full_path, args, cache)

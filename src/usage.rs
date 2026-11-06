@@ -1,7 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
-#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
@@ -179,26 +178,9 @@ pub fn directory_usage(path: &Path, args: &Args, cache: &mut WalkCache) -> u64 {
 
 /// Allocated size of one inode in bytes (512-byte blocks, as reported by
 /// st_blocks). This is what "space used" means; logical size and disk size
-/// differ for sparse files, and usage should reflect what is on disk. Unix
-/// only: WASI has no block information at all and gets no substitute.
-#[cfg(unix)]
+/// differ for sparse files, and usage should reflect what is on disk.
 pub fn blocks_bytes(blocks: u64) -> u64 {
     blocks * 512
-}
-
-/// Size basis of a single entry, in bytes: allocated blocks on Unix,
-/// the logical size on WASI (the only size its metadata can report; no
-/// honest "used" value exists there). The `-u` output column is refused at
-/// startup on WASI precisely because of this gap; the value still powers
-/// size sorting and internal plumbing, where a logical size is meaningful.
-#[cfg(unix)]
-pub fn disk_size(metadata: &fs::Metadata) -> u64 {
-    blocks_bytes(metadata.blocks())
-}
-
-#[cfg(not(unix))]
-pub fn disk_size(metadata: &fs::Metadata) -> u64 {
-    metadata.len()
 }
 
 fn walk_usage(
@@ -208,11 +190,6 @@ fn walk_usage(
     counted: &mut HashSet<(u64, u64)>,
 ) -> u64 {
     let mut total = 0u64;
-
-    // WASI has no stable inode accessors, so the hard-link cache goes unused
-    // and would otherwise warn there.
-    #[cfg(not(unix))]
-    let _ = counted;
 
     let entries = match fs::read_dir(path) {
         Ok(e) => e,
@@ -240,7 +217,7 @@ fn walk_usage(
 
         if is_real_dir {
             // The directory inode itself uses blocks on disk.
-            total += disk_size(&metadata);
+            total += blocks_bytes(metadata.blocks());
             // Descend only when the subtree can contribute something.
             if matches_filename
                 || subtree_contains_match(&full_path, 0, usize::MAX, args, cache)
@@ -250,11 +227,11 @@ fn walk_usage(
         } else if entry_file_matches(args, &name, &full_path, cache) {
             // Deduplicate hard links within this subtree: the second (and any
             // further) name for an already-counted inode adds nothing.
-            #[cfg(unix)]
-            if metadata.is_file() && !counted.insert((metadata.dev(), metadata.ino())) {
+            let inode = (metadata.dev(), metadata.ino());
+            if metadata.is_file() && !counted.insert(inode) {
                 continue;
             }
-            total += disk_size(&metadata);
+            total += blocks_bytes(metadata.blocks());
         }
     }
 
